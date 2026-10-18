@@ -1,0 +1,142 @@
+# ==============================================================================
+# docker-compose.titan.yml
+#
+# titan-monitor → traceway bridge: the OpenTelemetry Collector that polls
+# CloudWatch Metrics and ships them to a local traceway instance as OTLP.
+#
+# This file does NOT include the upstream traceway compose on purpose —
+# `include:` resolves relative paths against the file it's written in, and
+# the merge order is not always what you want. Instead, run it from the
+# traceway repo root with three `-f` flags:
+#
+#     docker compose \
+#         -f docker-compose.yml \
+#         -f docker-compose.sqlite.yml \
+#         -f titan/docker-compose.titan.yml \
+#         --env-file titan/.env \
+#         up -d
+#
+# The first two compose files are the upstream recipe (base all-in-one
+# stack with ClickHouse + Postgres, then the SQLite overlay that swaps the
+# traceway service's Dockerfile to the SQLite build). The third adds the
+# collector service and wires it onto the same default network so it can
+# reach `traceway` by hostname.
+# ==============================================================================
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.119.0
+    container_name: titan-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      # Bind-mount the collector config instead of baking it into a custom
+      # image so edits take effect on `docker compose restart otel-collector`
+      # without rebuilding. Compose resolves this relative path against the
+      # working directory you `docker compose` from, which the README pins
+      # to the traceway repo root.
+      - ./titan/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    environment:
+      # AWS creds + EC2 instance identity. ALL of these are read from the
+      # titan/.env file (gitignored) so the traceway repo never sees real
+      # secrets. The collector does not require AWS credentials when running
+      # outside AWS — it just won't be able to poll metrics.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION:-eu-west-3}
+      TITAN_ENV: ${TITAN_ENV:-dev}
+
+      # Where to ship logs. The compose network resolves `traceway` to
+      # the upstream service container. Override to
+      # http://host.docker.internal:80 if you're on macOS/Windows and run
+      # traceway outside docker.
+      TRACEWAY_OTLP_ENDPOINT: ${TRACEWAY_OTLP_ENDPOINT_LOGS:-http://traceway:80/api/otel/v1/logs}
+      # The otlphttp exporter appends /v1/<signal> automatically. Pass it
+      # the BASE URL (no /v1/logs suffix) — otherwise it sends to
+      # /api/otel/v1/logs/v1/logs and traceway returns 404.
+      TRACEWAY_OTLP_ENDPOINT_BASE: ${TRACEWAY_OTLP_ENDPOINT_LOGS_BASE:-http://traceway:80/api/otel}
+
+      # The project bearer token. Get it from the traceway dashboard once:
+      #   1. Open http://localhost:80
+      #   2. Register / log in
+      #   3. Settings → Projects → New project (framework = OpenTelemetry)
+      #   4. Copy the project token into titan/.env as OTLP_TOKEN
+      # Traceway's UseClientAuth middleware treats this exactly like the
+      # browser SDK's Bearer token, so it will route data into the project.
+      OTLP_TOKEN: ${TRACEWAY_BACKEND_TOKEN}
+    depends_on:
+      - traceway
+    # Reuse the upstream services' default network (compose prepends the
+    # project name → e.g. `traceway_default`). No `networks:` block needed:
+    # a service without one is attached to every default-network project
+    # that ships via `-f`.
+    healthcheck:
+      # The collector's own /health endpoint (default :13133) returns 200
+      # once the config is parsed and the pipeline is wired. If it doesn't
+      # come up in 30 s the AWS creds are almost always wrong.
+      test: ["CMD", "wget", "-qO-", "http://localhost:13133/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  cw-metrics-exporter:
+    # CloudWatch Metrics → OTLP. The OTel Collector contrib has no first-
+    # party CW Metrics receiver, so this sidecar polls GetMetricData
+    # directly with boto3. Image is built from
+    # titan/cw-metrics-exporter/Dockerfile so the Python SDK versions
+    # stay pinned (newer OTel majors flip a lot of defaults).
+    build:
+      context: ./titan/cw-metrics-exporter
+    container_name: titan-cw-metrics-exporter
+    restart: unless-stopped
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-west-3}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      EC2_INSTANCE_ID: ${EC2_INSTANCE_ID}
+      TITAN_ENV: ${TITAN_ENV:-dev}
+
+      # The OTel Python SDK's HTTP exporter appends /v1/metrics itself, so
+      # we feed it the base URL and the script strips the suffix. The
+      # default matches the collector's TRACEWAY_OTLP_ENDPOINT, but it's
+      # separate so you can route metrics and logs to different traceway
+      # projects if you ever need to.
+      OTLP_ENDPOINT: ${TRACEWAY_OTLP_ENDPOINT_METRICS:-http://traceway:80/api/otel/v1/metrics}
+      OTLP_TOKEN: ${TRACEWAY_BACKEND_TOKEN}
+      POLL_INTERVAL_S: ${CW_POLL_INTERVAL_S:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      - traceway
+
+  cw-logs-metrics-exporter:
+    # CloudWatch Logs → OTLP metrics. Pairs with the OTel collector which
+    # already ships structured logs: the collector cannot derive metric
+    # points from log attributes on its own (no "log → metric" processor
+    # in 0.119.0), so we run a sibling sidecar that re-reads the same
+    # activity-log stream from CW Logs, parses the JSON each api/activity_logger
+    # call wrote, and emits the OTLP metrics that drive traceway's
+    # Endpoints page and endpoint-scoped notification rules
+    # (error_rate_threshold, endpoint_p95_threshold).
+    build:
+      context: ./titan/cw-logs-metrics-exporter
+    container_name: titan-cw-logs-metrics-exporter
+    restart: unless-stopped
+    environment:
+      AWS_REGION: ${AWS_REGION:-eu-west-3}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      EC2_INSTANCE_ID: ${EC2_INSTANCE_ID}
+      TITAN_ENV: ${TITAN_ENV:-dev}
+      LOG_GROUP_PREFIX: ${LOG_GROUP_PREFIX:-/aws/ec2/titanprediction/}
+
+      # We pass the FULL OTLP path (with /v1/metrics) here — the Python
+      # SDK uses it verbatim, not as a base. Same convention as
+      # cw-metrics-exporter above. Override TRACEWAY_OTLP_ENDPOINT_METRICS
+      # to route these to a different traceway project if needed.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${TRACEWAY_OTLP_ENDPOINT_METRICS:-http://traceway:80/api/otel/v1/metrics}
+      OTLP_TOKEN: ${TRACEWAY_BACKEND_TOKEN}
+      POLL_INTERVAL_S: ${CW_POLL_INTERVAL_S:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      - traceway

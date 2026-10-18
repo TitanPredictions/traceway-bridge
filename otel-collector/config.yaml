@@ -1,0 +1,204 @@
+# ==============================================================================
+# titan-monitor → traceway bridge (OpenTelemetry Collector)
+# ==============================================================================
+#
+# Replaces the CloudWatch Logs half of the legacy `titan-monitor groups/logs`
+# CLI by subscribing to the same `/aws/ec2/titanprediction/{env}/{api,...}`
+# log groups via the OTel Collector's awscloudwatch receiver and shipping
+# them as OTLP logs to a local traceway instance.
+#
+# Pipeline:
+#
+#   awscloudwatch (poll CW Logs API)
+#         │
+#         ▼  resource attributes / batch
+#   resource ──► otlphttp ──► http://traceway:80/api/otel/v1/logs
+#
+# Auth:
+#   AWS  — read AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION from
+#          the .env next to this file (loaded by docker-compose).
+#   traceway — read the project token from .env (OTLP_TOKEN).
+#
+# IMPORTANT — metrics are NOT here.
+#   The OTel Collector's awscloudwatch receiver only ingests CloudWatch Logs
+#   (its `logs:` block is the only config the schema accepts; metrics
+#   support is "Undefined"). The CloudWatch Metrics half of titan-monitor
+#   is handled by `titan/cw-metrics-exporter/` — a small Python sidecar
+#   that uses boto3 + the GetMetricData API to poll the same EC2 + CWAgent
+#   metrics and push them as OTLP. This split mirrors what titan-monitor
+#   itself did: two different APIs (Logs vs Metrics), two different tools.
+# ==============================================================================
+
+receivers:
+  awscloudwatch:
+    region: ${env:AWS_REGION}
+    # Poll CW Logs every minute. The legacy CLI read on demand; 60 s matches
+    # the cadence we want from the live TUI mode.
+    logs:
+      poll_interval: 60s
+      # Cap how many events a single API call processes — keeps one large
+      # group's flood from saturating the pipeline.
+      max_events_per_request: 100
+      groups:
+        autodiscover:
+          # The legacy CLI discovers groups via the
+          # `/aws/ec2/titanprediction/{env}/{subsystem}` convention. Pin
+          # that prefix so we don't accidentally subscribe to other groups
+          # in the AWS account (lambda, etc.).
+          prefix: /aws/ec2/titanprediction/
+          limit: 100
+          # Note: do NOT set `streams.prefixes` here. CW log STREAM names
+          # are auto-generated (e.g. `ip-172-31-33-250/652076` for the
+          # gunicorn worker that handled the request), so filtering by
+          # `/api` etc. matches nothing. The legacy CLI's `/api` filter
+          # ran against the log group SHORT name, not the stream name —
+          # the awscloudwatch receiver's filter runs against stream
+          # names, so leaving them unset is the right default.
+
+processors:
+  # Stamp every log line with the project / environment so the traceway
+  # dashboard can group them. service.name doubles as the OTLP service
+  # identity.
+  resource:
+    attributes:
+      - key: cloud.provider
+        value: aws
+        action: upsert
+      - key: cloud.region
+        value: ${env:AWS_REGION}
+        action: upsert
+
+  # NOTE on metrics from logs: the OTel collector does not have a
+  # native "log → metric" processor. ``metricstransform`` operates on
+  # already-existing metric data only (rename / aggregate), so feeding
+  # the parsed log attributes through it does nothing useful. To get
+  # the Endpoints page, P95 latency, or endpoint-scoped notification
+  # rules from CW logs alone, you'd need a small Python service that
+  # scans the parsed log stream and emits OTLP metric points — that is
+  # roughly the same shape as cw-metrics-exporter, just driven off the
+  # logs it gets from CW. We have not built that here.
+
+  # Derive service.name + deployment.environment.name from the CW log
+  # group name the receiver already populated on each resource
+  # (`cloudwatch.log.group.name`). One group per subsystem gives one
+  # service per subsystem, so the dashboard can filter separately:
+  #
+  #   /aws/ec2/titanprediction/{env}/{subsystem}
+  #         ^                  ^    ^
+  #         fixed              4    5   <- Split indexes
+  #
+  # Result: titan-api, titan-api-errors, titan-api-admin, titan-db,
+  # titan-services — each its own service.name. Plus environment derived
+  # from the same path so dev logs land as `dev`, prod logs as `prod`,
+  # even though the container started with TITAN_ENV=prod.
+  transform/logs:
+    error_mode: ignore
+    log_statements:
+      - context: resource
+        statements:
+          # Seed service.name with the group path, then mutate the prefix
+          # in place. `replace_pattern` is an OTTL editor (statement), not
+          # a function — it works on an existing target.
+          # Path shape: /aws/ec2/titanprediction/{prod|dev}/{subsystem}
+          #
+          # NOTE: in `context: resource`, the path is `resource.attributes[...]`,
+          # NOT plain `attributes[...]`. The plain form silently scopes to
+          # the LOG RECORD and gets ignored by the batch resource.
+          - set(resource.attributes["service.name"], resource.attributes["cloudwatch.log.group.name"])
+          - replace_pattern(resource.attributes["service.name"], "^.*/(prod|dev)/", "titan-")
+          # Environment — `where` clause is a boolean expression with `and`.
+          - set(resource.attributes["deployment.environment.name"], "prod") where(resource.attributes["cloudwatch.log.group.name"] != "" and IsMatch(resource.attributes["cloudwatch.log.group.name"], "/prod/"))
+          - set(resource.attributes["deployment.environment.name"], "dev") where(resource.attributes["cloudwatch.log.group.name"] != "" and IsMatch(resource.attributes["cloudwatch.log.group.name"], "/dev/"))
+      - context: log
+        statements:
+          # Parse JSONL bodies — but only when the body actually looks like
+          # JSON (starts with `{`). The Titan backend has two logger
+          # families:
+          #   api/activity_logger.py, services/activity_logger.py,
+          #   ai_agent/observability/tracing.py all emit raw JSON via
+          #     `logger.info(json.dumps(entry))`.
+          #   services/db/activity_logger.py and the websocket server use
+          #     stdlib logging with `Formatter("%(message)s")`, so only the
+          #     message string ends up in CloudWatch — not JSON.
+          # Without the prefix guard, ParseJSON warns and error_mode=ignore
+          # keeps the record, but the indexed assignments below silently
+          # produce empty values.
+          - 'set(log.attributes["titan.parsed"], ParseJSON(log.body)) where(log.body != "" and IsMatch(log.body, "^\\{"))'
+          # Lift each top-level field out as a flat log attribute. The
+          # intermediate `titan.parsed` KvlistValue is dropped at
+          # traceway's extractAttributes anyway, but we keep the wire
+          # payload tidy.
+          - set(log.attributes["titan.action"], log.attributes["titan.parsed"]["action"])
+          - set(log.attributes["titan.status"], log.attributes["titan.parsed"]["status"])
+          - set(log.attributes["titan.username"], log.attributes["titan.parsed"]["username"])
+          - set(log.attributes["titan.endpoint"], log.attributes["titan.parsed"]["endpoint"])
+          - set(log.attributes["titan.method"], log.attributes["titan.parsed"]["method"])
+          - set(log.attributes["titan.phase"], log.attributes["titan.parsed"]["phase"])
+          - set(log.attributes["titan.duration_ms"], log.attributes["titan.parsed"]["duration_ms"])
+          - set(log.attributes["titan.error"], log.attributes["titan.parsed"]["error"])
+          - set(log.attributes["titan.traceback"], log.attributes["titan.parsed"]["traceback"])
+          - set(log.attributes["titan.ip"], log.attributes["titan.parsed"]["ip"])
+          - set(log.attributes["titan.user_agent"], log.attributes["titan.parsed"]["user_agent"])
+          # Mirror to OTel semantic-convention attribute names so the
+          # traceway Endpoints page and dashboard widgets can use them
+          # without any per-source custom mapping. Names follow the
+          # OTel HTTP semantic conventions:
+          # https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+          - set(log.attributes["http.request.method"], log.attributes["titan.method"]) where(log.attributes["titan.method"] != "")
+          - set(log.attributes["url.path"], log.attributes["titan.endpoint"]) where(log.attributes["titan.endpoint"] != "")
+          - set(log.attributes["http.response.status_code"], log.attributes["titan.status_code"]) where(log.attributes["titan.status_code"] != "")
+          - set(log.attributes["client.address"], log.attributes["titan.ip"]) where(log.attributes["titan.ip"] != "")
+          - set(log.attributes["user_agent.original"], log.attributes["titan.user_agent"]) where(log.attributes["titan.user_agent"] != "")
+          - set(log.attributes["enduser.id"], log.attributes["titan.username"]) where(log.attributes["titan.username"] != "")
+          - set(log.attributes["exception.message"], log.attributes["titan.error"]) where(log.attributes["titan.error"] != "")
+          - set(log.attributes["exception.stacktrace"], log.attributes["titan.traceback"]) where(log.attributes["titan.traceback"] != "")
+          - delete_key(log.attributes, "titan.parsed")
+          # Map Titan status / phase to OTel severity so traceway can use
+          # it for Issues (severity_text="ERROR" → becomes an Issue) and
+          # the log-search severity filter. OTel severity numbers:
+          # WARN=13, ERROR=17.
+          - 'set(log.severity_text, "ERROR") where(log.attributes["titan.status"] == "error" or log.attributes["titan.phase"] == "error")'
+          - 'set(log.severity_number, 17) where(log.attributes["titan.status"] == "error" or log.attributes["titan.phase"] == "error")'
+          - 'set(log.severity_text, "WARN") where(log.attributes["titan.status"] == "failure" or log.attributes["titan.status"] == "blocked")'
+          - 'set(log.severity_number, 13) where(log.attributes["titan.status"] == "failure" or log.attributes["titan.status"] == "blocked")'
+          # Shorten the body to just the action+status+message so the Logs
+          # UI shows a useful one-liner instead of raw JSON. For DB-style
+          # plain-string bodies (no JSON parse) we leave the body alone.
+          - 'set(log.body, Concat([log.attributes["titan.action"], " ", log.attributes["titan.status"]], "")) where(log.attributes["titan.action"] != "" and log.attributes["titan.status"] != "")'
+          - 'set(log.body, Concat([log.attributes["titan.phase"], " (svc=", log.attributes["titan.parsed"]["service"], ")"], "")) where(log.attributes["titan.action"] == "" and log.attributes["titan.phase"] != "")'
+          - 'keep_keys(resource.attributes, ["service.name", "service.instance.id", "deployment.environment.name", "cloud.provider", "cloud.region", "host.name"])'
+
+  # Batch — traceway's /api/otel/v1/logs handler is sized for batches.
+  batch:
+    timeout: 10s
+    send_batch_size: 1024
+
+exporters:
+  otlphttp:
+    # The otlphttp exporter appends /v1/<signal> when given a BASE URL,
+    # but uses the URL verbatim when given the FULL path. TRACEWAY_OTLP_ENDPOINT
+    # may carry `/v1/logs`; strip it here so the export lands on the
+    # actual route (and on the right path under any future change).
+    endpoint: ${env:TRACEWAY_OTLP_ENDPOINT_BASE}
+    # Project bearer auth. The header name is the OTel standard
+    # (api-key) which traceway maps to its Bearer token via UseClientAuth.
+    headers:
+      Authorization: Bearer ${env:OTLP_TOKEN}
+    # Traceway supports gzip on OTLP — the gzip middleware on /api/otel/v1/*
+    # decompresses before ingest. Save a few bytes per log line.
+    compression: gzip
+    timeout: 30s
+    retry_on_failure:
+        enabled: true
+        initial_interval: 5s
+        max_interval: 30s
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    logs:
+      receivers: [awscloudwatch]
+      processors: [resource, transform/logs, batch]
+      exporters: [otlphttp]
