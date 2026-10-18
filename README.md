@@ -175,6 +175,18 @@ traceway UI affordance:
 | `correlate` | overlay CPU/mem metrics with error log spikes on one timeline | Dashboard → **Metrics** + **Logs** side by side; both time-sync against `time-range` URL params |
 | `graph` | 3-day multi-panel chart with live updates | Dashboard → time range `3d`, query all four CW metrics, group by metric name |
 
+**Endpoints page (the gap `titan-monitor graph` left):** traceway's
+**Endpoints** page is span-driven, not metric-driven — it only
+materialises rows from server/INTERNAL spans that carry `http.route`.
+The `cw-logs-metrics-exporter` sidecar pushes one synthetic INTERNAL
+span per request log to `/api/otel/v1/traces`, which is enough for
+traceway's `trace_converter` to build an `endpoints_v2` row per
+`(method, route, status_code)` triple. **No OTel SDK in the Flask app
+required.** Trade-offs: every span has a fresh random `trace_id` /
+`span_id` (no link to browser-side `traceparent` headers), and there's
+no waterfall view — but `/endpoints` populates with the same
+P50/P95/P99 / error rate / counts as a properly-instrumented app.
+
 **Subcommands without a direct equivalent**:
 
 - `--follow` streaming. Traceway's log view auto-refreshes when the time

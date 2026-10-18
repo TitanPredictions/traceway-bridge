@@ -135,6 +135,9 @@ services:
       # cw-metrics-exporter above. Override TRACEWAY_OTLP_ENDPOINT_METRICS
       # to route these to a different traceway project if needed.
       OTEL_EXPORTER_OTLP_ENDPOINT: ${TRACEWAY_OTLP_ENDPOINT_METRICS:-http://traceway:80/api/otel/v1/metrics}
+      # Traces go to a separate path on traceway (/v1/traces). Same token,
+      # same service.name on the resource. Defaults to the standard path.
+      TRACEWAY_OTLP_ENDPOINT_TRACES: ${TRACEWAY_OTLP_ENDPOINT_TRACES:-http://traceway:80/api/otel/v1/traces}
       OTLP_TOKEN: ${TRACEWAY_BACKEND_TOKEN}
       POLL_INTERVAL_S: ${CW_POLL_INTERVAL_S:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

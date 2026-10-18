@@ -1,40 +1,49 @@
 """
-cw-logs-metrics-exporter — emit per-endpoint OTLP metrics from CW Logs.
+cw-logs-metrics-exporter — emit per-endpoint OTLP metrics AND synthetic
+spans from CW Logs.
 
 This is the half that the OTel collector can't do alone: ``metricstransform``
 operates on already-existing metric data only, not on log records, so it
 cannot derive per-endpoint counters, error counts, or latency histograms
 from the activity log stream the way the traceway Endpoints page needs.
+And, separately: the traceway Endpoints page is span-driven — it only
+materialises rows from SERVER/INTERNAL spans that carry ``http.route``.
+A metric stream alone gives you custom widgets and notification rules
+but no Endpoints page.
 
-This sidecar fills that gap by:
+This sidecar fills both gaps by:
 
   1. Polling CloudWatch Logs via ``filter_log_events`` on the same prefix
      (``/aws/ec2/titanprediction/``) the OTel collector subscribes to.
   2. Parsing each event body with ``json.loads`` (the Titan backend writes
      one JSON object per line — see ``api/activity_logger.py``).
-  3. Recording OTLP metric points via the same
-     ``opentelemetry-exporter-otlp-proto-http`` package
-     ``cw-metrics-exporter`` already uses, with the right OTel HTTP
-     semantic conventions (``http.server.request.duration``,
-     ``http.request.method``, ``url.path``, ``http.response.status_code``,
-     ``service.name``).
+  3. Recording OTLP metric points (counters + histogram) with the right
+     OTel HTTP semantic conventions.
+  4. Recording ONE synthetic OTLP span per request — enough for traceway's
+     ``trace_converter`` to build an ``endpoints_v2`` row per
+     (method, route, status_code) triple. This is the half that makes the
+     ``/endpoints`` page populate, without ever instrumenting the Flask
+     app with the OTel SDK. Trade-offs documented at the bottom of this
+     file.
 
-The result lands in traceway as proper metric streams that drive the
-Endpoints page, P50/P95/P99 latency, and the ``error_rate_threshold`` /
-``endpoint_p95_threshold`` / ``error_count_threshold`` notification rules —
-none of which can be evaluated off log records alone.
+The result lands in traceway as proper metric streams that drive
+custom widgets, P50/P95/P99 latency, and the ``error_rate_threshold`` /
+``endpoint_p95_threshold`` / ``error_count_threshold`` notification rules,
+plus one Endpoints row per request, which drives the ``/endpoints``
+page drill-down.
 
 Duplicate handling
 ------------------
 ``filter_log_events`` is a query, not a subscription — every poll returns
 the events that match the time window, even ones already returned. We
-remember the ``eventId`` of each emitted point and drop duplicates, so a
-restart of this exporter does not double-count. The cache is bounded by
-the number of events that arrive in one poll cycle (typically tens),
-so it never grows unbounded.
+remember the ``eventId`` of each emitted point/span and drop duplicates,
+so a restart of this exporter does not double-count. The cache is
+bounded by the number of events that arrive in one poll cycle (typically
+tens), so it never grows unbounded.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -42,14 +51,19 @@ import signal
 import sys
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import boto3
-from opentelemetry import metrics
+from opentelemetry import metrics, trace
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +77,13 @@ AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 OTEL_EXPORTER_OTLP_ENDPOINT = os.environ.get(
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "http://traceway:80/api/otel/v1/metrics",
+)
+# Trace endpoint defaults to the same base path with /v1/traces. Override
+# with TRACEWAY_OTLP_ENDPOINT_TRACES if you want to route traces and
+# metrics to different traceway projects.
+TRACEWAY_OTLP_ENDPOINT_TRACES = os.environ.get(
+    "TRACEWAY_OTLP_ENDPOINT_TRACES",
+    "http://traceway:80/api/otel/v1/traces",
 )
 OTLP_TOKEN = os.environ["OTLP_TOKEN"]
 
@@ -113,6 +134,22 @@ reader = PeriodicExportingMetricReader(
 )
 meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
 meter = meter_provider.get_meter("cw-logs-metrics-exporter")
+
+# ---------------------------------------------------------------------------
+# Trace SDK — emits one synthetic span per request, just enough for traceway's
+# trace_converter to build an ``endpoints_v2`` row per (method, route, status).
+# We can't reuse the metric endpoint: the OTLP signals live at different
+# paths (/v1/metrics vs /v1/traces), so we set up a separate TracerProvider
+# pointed at TRACEWAY_OTLP_ENDPOINT_TRACES.
+# ---------------------------------------------------------------------------
+
+span_exporter = OTLPSpanExporter(
+    endpoint=TRACEWAY_OTLP_ENDPOINT_TRACES,
+    headers={"Authorization": f"Bearer {OTLP_TOKEN}"},
+)
+tracer_provider = TracerProvider(resource=resource)
+tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
+tracer = tracer_provider.get_tracer("cw-logs-metrics-exporter")
 
 
 # Histogram for request latency. Buckets tuned for an API whose p99 sits
@@ -247,9 +284,128 @@ def record_event(event: dict[str, Any]) -> None:
     elif _is_client_error_status(status_code):
         CLIENT_ERROR_COUNT.add(1, attributes=attrs)
 
+    # Synthetic span — drives the traceway /endpoints page. The span is
+    # INTERNAL with no parent (so ``isEntryPoint`` in the trace_converter
+    # returns true) and carries ``http.request.method`` + ``url.path``,
+    # which is what buildEndpoint keys on. We pass the FULL URL with
+    # /v1/traces because the OTel SDK uses endpoint= verbatim (the
+    # auto-append only happens via the OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+    # env var, not via the constructor).
+    emit_synthetic_span(
+        entry=entry,
+        method=method,
+        endpoint=endpoint,
+        status_code=status_code,
+        duration_ms=duration_ms,
+    )
+
     if event_id:
         with _seen_lock:
             _seen_event_ids.add(event_id)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic span emission
+# ---------------------------------------------------------------------------
+
+
+def _endpoints_v2_url(endpoint: str) -> str:
+    """``GET /foo/123`` → ``/foo/123``. Strips the method, returns the path."""
+    parts = endpoint.split(" ", 1)
+    if len(parts) == 2 and parts[0].upper() in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}:
+        return parts[1]
+    return endpoint
+
+
+def emit_synthetic_span(
+    entry: dict[str, Any],
+    method: str,
+    endpoint: str,
+    status_code: int | None,
+    duration_ms: Any,
+) -> None:
+    """Emit one INTERNAL span with HTTP attributes that the traceway
+    ``trace_converter`` recognises as an endpoint entry point.
+
+    Synthetic because:
+
+      * ``trace_id`` / ``span_id`` are random per emit. We don't need
+        them to be deterministic — the ``_seen_event_ids`` cache
+        already dedupes by CW ``eventId``, so a restart of this exporter
+        does not duplicate endpoint rows. Deterministic IDs would
+        help log↔span correlation in the traceway UI, but the cost
+        (reaching into the OTel SDK's low-level context layer) is not
+        worth it for a best-effort view.
+      * ``parent_span_id`` is empty — every span is a root. This is the
+        one shape that ``isEntryPoint`` accepts for INTERNAL spans
+        (``len(span.ParentSpanId) == 0 && hasHTTPAttributes``).
+      * No distributed-trace context: the front-end's ``traceparent``
+        header is not in the activity log, so we cannot link browser
+        spans to backend spans. Each backend request stands alone as a
+        one-span "trace" — enough for endpoints, not for waterfalls.
+
+    Endpoints page: each unique (method, route) triple becomes one row,
+    with P50/P95/P99 over the duration. The whole /endpoints page is
+    derived from these rows by traceway's query layer.
+    """
+    # CORS preflights: we have method+endpoint, but they're noise on
+    # the Endpoints page. Skip them — preflights are handled by
+    # browser-side CORS, not real routes.
+    if method.upper() == "OPTIONS":
+        return
+
+    # The log body carries an ISO-8601 ``timestamp``; back-compute the
+    # start time so endTime - startTime matches the recorded duration.
+    # If parsing fails, fall back to ``now``.
+    end_time = datetime.now(timezone.utc)
+    ts_raw = entry.get("timestamp")
+    if ts_raw:
+        try:
+            end_time = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            if end_time.tzinfo is None:
+                end_time = end_time.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    duration_ns = 0
+    if isinstance(duration_ms, (int, float)) and duration_ms >= 0:
+        duration_ns = int(duration_ms * 1_000_000)
+
+    start_time_unix_nano = int(end_time.timestamp() * 1_000_000_000) - duration_ns
+    end_time_unix_nano = start_time_unix_nano + duration_ns
+
+    span = tracer.start_span(
+        name=endpoint,
+        start_time=start_time_unix_nano,
+    )
+    try:
+        span.set_attribute("http.request.method", method)
+        # Prefer ``http.route`` (the matched pattern, e.g. ``/users/<id>``).
+        # We don't have it from the access log, so we fall back to the
+        # full ``url.path``. The trace_converter accepts either.
+        span.set_attribute("url.path", _endpoints_v2_url(endpoint))
+        if status_code is not None:
+            span.set_attribute("http.response.status_code", int(status_code))
+        ip = entry.get("ip")
+        if ip:
+            span.set_attribute("client.address", ip)
+        ua = entry.get("user_agent")
+        if ua:
+            span.set_attribute("user_agent.original", ua)
+        username = entry.get("username")
+        if username:
+            span.set_attribute("enduser.id", username)
+        # End the span at the recorded end time so duration is non-zero
+        # in the traceway UI. ``start_time`` was set on start; the SDK
+        # records end_time on .end().
+        span.end(end_time=end_time_unix_nano)
+    except Exception:
+        # If the SDK is shut down mid-emit, span.end() may raise. Always
+        # release the span so we don't leak.
+        try:
+            span.end()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +475,9 @@ def main() -> int:
                 break
             time.sleep(1)
 
-    log.info("shutting down, flushing meter provider")
+    log.info("shutting down, flushing providers")
     meter_provider.shutdown()
+    tracer_provider.shutdown()
     return 0
 
 
