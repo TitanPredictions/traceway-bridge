@@ -1,21 +1,27 @@
-# titan → traceway bridge
+# traceway-bridge — TitanPrediction observability
 
 Replaces the legacy [`titan-monitor`](#migration-off-titan-monitor) CLI
 (CloudWatch Logs + EC2/CWAgent Metrics viewer) with a local Traceway stack
 ingesting the same data via OpenTelemetry.
 
-## Layout
+
 
 ```
-titan/
+traceway-bridge/
 ├── README.md                       ← you are here
+├── TODO.md                         ← roadmap / open work
+├── CONTRIBUTING.md                 ← dev guide
+├── Makefile                        ← make up / logs / down / token
 ├── .env.example                    ← copy to .env and fill in
-├── docker-compose.titan.yml        ← adds the two sidecars
+├── docker-compose.titan.yml        ← the three sidecars + the OTel collector
 ├── otel-collector/
-│   └── config.yaml                 ← CW Logs → OTLP pipeline
-└── cw-metrics-exporter/
+│   └── config.yaml                 ← CW Logs → OTLP pipeline + synthetic span transform
+├── cw-metrics-exporter/
+│   ├── Dockerfile
+│   └── cw_metrics_exporter.py      ← CW Metrics → OTLP via boto3
+└── cw-logs-metrics-exporter/
     ├── Dockerfile
-    └── cw_metrics_exporter.py      ← CW Metrics → OTLP via boto3
+    └── cw_logs_metrics_exporter.py  ← CW Logs → OTLP metrics + synthetic spans
 ```
 
 ## Architecture
@@ -75,8 +81,8 @@ in `.env`.
 ### 2. Fill in `.env`
 
 ```bash
-cp titan/.env.example titan/.env
-$EDITOR titan/.env
+cp .env.example .env
+$EDITOR .env
 ```
 
 Required:
@@ -90,7 +96,7 @@ Required:
 | `TITAN_ENV` | `dev` on a laptop, `prod` on EC2 |
 | `OTLP_TOKEN` | The project bearer token from step 1 |
 
-`titan/.env` is gitignored — secrets never land in the traceway repo.
+`./.env` is gitignored — secrets never land in the traceway repo.
 
 ### 3. Bring up the stack
 
@@ -100,8 +106,8 @@ From the traceway repo root:
 docker compose \
     -f docker-compose.yml \
     -f docker-compose.sqlite.yml \
-    -f titan/docker-compose.titan.yml \
-    --env-file titan/.env \
+    -f docker-compose.titan.yml \
+    --env-file .env \
     up -d --build
 ```
 
@@ -116,7 +122,7 @@ is pulled.
 
 ```bash
 # All five containers up and healthy
-docker compose -f docker-compose.yml -f docker-compose.sqlite.yml -f titan/docker-compose.titan.yml --env-file titan/.env ps
+docker compose -f docker-compose.yml -f docker-compose.sqlite.yml -f docker-compose.titan.yml --env-file .env ps
 
 # traceway serves the dashboard
 curl -sI http://localhost/health
@@ -152,12 +158,12 @@ timestamp.
 
 | Want | How |
 |------|-----|
-| Faster / slower metrics poll | `CW_POLL_INTERVAL_S=15` in `.env` (and `TraceWayWayOtlCollector.logs.poll_interval` in `titan/otel-collector/config.yaml` for logs) |
-| Different log-group prefix | `titan/otel-collector/config.yaml` → `awscloudwatch.logs.groups.autodiscover.prefix` (default `/aws/ec2/titanprediction/`) |
-| Different log streams | `titan/otel-collector/config.yaml` → `awscloudwatch.logs.groups.autodiscover.streams.prefixes` (defaults to `/api /api-errors /api-admin /db /services`) |
+| Faster / slower metrics poll | `CW_POLL_INTERVAL_S=15` in `.env` (and `TraceWayWayOtlCollector.logs.poll_interval` in `./otel-collector/config.yaml` for logs) |
+| Different log-group prefix | `./otel-collector/config.yaml` → `awscloudwatch.logs.groups.autodiscover.prefix` (default `/aws/ec2/titanprediction/`) |
+| Different log streams | `./otel-collector/config.yaml` → `awscloudwatch.logs.groups.autodiscover.streams.prefixes` (defaults to `/api /api-errors /api-admin /db /services`) |
 | Route logs and metrics to different projects | Set `TRACEWAY_OTLP_ENDPOINT_LOGS` / `TRACEWAY_OTLP_ENDPOINT_METRICS` in `.env` to two different traceway URLs and create two projects |
 | Run traceway outside docker (macOS/Windows) | Override both `*_OTLP_ENDPOINT` env vars to `http://host.docker.internal:80/...` |
-| Drop the collector (logs are off the table) | Comment out the `otel-collector:` block in `titan/docker-compose.titan.yml` |
+| Drop the collector (logs are off the table) | Comment out the `otel-collector:` block in `./docker-compose.titan.yml` |
 | Drop the metrics sidecar | Comment out the `cw-metrics-exporter:` block |
 
 ## Migration off titan-monitor
@@ -194,7 +200,7 @@ is matched API routes. The Endpoints page's attribute filter lets you
 split noise from real traffic, set alerts on noise volume, and assess
 the EC2 performance cost of serving 404s (count × p50 = CPU-seconds
 spent on bots). Adjust the prefix lists in
-`titan/cw-logs-metrics-exporter/cw_logs_metrics_exporter.py` if the
+`./cw-logs-metrics-exporter/cw_logs_metrics_exporter.py` if the
 boundary needs to move.
 
 **Subcommands without a direct equivalent**:
@@ -242,18 +248,18 @@ These are the natural next steps once the basic bridge works:
 | Sidecar logs `An error occurred (AccessDenied)` on `GetMetricData` | IAM key lacks `cloudwatch:GetMetricData` (metrics sidecar) or `logs:*` (collector) |
 | Collector logs `NoCredentialProviders` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` not set in `.env` |
 | Dashboard empty for `titan-ec2` / `titan-cloudwatch` | `OTLP_TOKEN` wrong, or traceway project was deleted, or traceway isn't on `:80` (check `TRACEWAY_OTLP_ENDPOINT_*`) |
-| `docker compose config` complains about `docker-compose.sqlite.yml` not found | Run from the traceway repo root (`cd /path/to/traceway`), not from inside `titan/` |
+| `docker compose config` complains about `docker-compose.sqlite.yml` not found | Run from the traceway repo root (`cd /path/to/traceway`), not from inside `./` |
 | OTel collector OOMKilled | `awscloudwatch` is streaming too many events; raise `logs.max_events_per_request` cap or narrow `groups.autodiscover.prefix` |
 
 ## File-by-file reference
 
-- **`titan/otel-collector/config.yaml`** — pipeline config. Top-of-file
+- **`./otel-collector/config.yaml`** — pipeline config. Top-of-file
   comment block explains the design choices. Edit in place; `docker
   compose restart titan-otel-collector` picks up changes.
-- **`titan/cw-metrics-exporter/cw_metrics_exporter.py`** — the
+- **`./cw-metrics-exporter/cw_metrics_exporter.py`** — the
   boto3/OTel SDK sidecar. Single file, ~150 lines. Top-of-file docstring
   is the API contract.
-- **`titan/docker-compose.titan.yml`** — adds the two sidecars; merges
+- **`./docker-compose.titan.yml`** — adds the two sidecars; merges
   with `docker-compose.yml` + `docker-compose.sqlite.yml`. No service
   overrides on the upstream traceway image.
-- **`titan/.env.example`** — annotated env-var template. Copy to `.env`.
+- **`./.env.example`** — annotated env-var template. Copy to `.env`.

@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-bridge:
+    name: Validate bridge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax check
+        run: |
+          for m in cw-metrics-exporter/cw_metrics_exporter.py \
+                   cw-logs-metrics-exporter/cw_logs_metrics_exporter.py; do
+            echo "checking $m"
+            python3 -m py_compile "$m"
+          done
+
+      - name: Validate OTel collector config
+        run: |
+          docker run --rm \
+            -v "$PWD/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro" \
+            -e AWS_ACCESS_KEY_ID=AKIA_PLACEHOLDER \
+            -e AWS_SECRET_ACCESS_KEY=placeholder \
+            -e AWS_REGION=eu-west-3 \
+            -e TITAN_ENV=prod \
+            -e TRACEWAY_OTLP_ENDPOINT_BASE=http://traceway:80/api/otel \
+            -e TRACEWAY_OTLP_ENDPOINT_LOGS_BASE=http://traceway:80/api/otel \
+            -e OTLP_TOKEN=placeholder \
+            otel/opentelemetry-collector-contrib:0.119.0 \
+            validate --config=/etc/otelcol/config.yaml

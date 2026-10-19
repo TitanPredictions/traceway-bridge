@@ -1,0 +1,25 @@
+# secrets — never commit
+.env
+*.env.local
+.envrc
+.direnv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-*/
+.pytest_cache/
+.mypy_cache/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# docker
+.docker/
+
+# build artifacts
+*.log
