@@ -187,6 +187,16 @@ required.** Trade-offs: every span has a fresh random `trace_id` /
 no waterfall view — but `/endpoints` populates with the same
 P50/P95/P99 / error rate / counts as a properly-instrumented app.
 
+**Bot-scan / noise visibility:** every synthetic span carries the
+attribute `titan.path_category: real|noise`. Noise is anything not
+under `/api/` (Joomla-exploit scanners, `.git/HEAD` probes, etc.); real
+is matched API routes. The Endpoints page's attribute filter lets you
+split noise from real traffic, set alerts on noise volume, and assess
+the EC2 performance cost of serving 404s (count × p50 = CPU-seconds
+spent on bots). Adjust the prefix lists in
+`titan/cw-logs-metrics-exporter/cw_logs_metrics_exporter.py` if the
+boundary needs to move.
+
 **Subcommands without a direct equivalent**:
 
 - `--follow` streaming. Traceway's log view auto-refreshes when the time

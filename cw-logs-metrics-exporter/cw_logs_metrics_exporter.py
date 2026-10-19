@@ -179,6 +179,41 @@ CLIENT_ERROR_COUNT = meter.create_counter(
 )
 
 
+# Path category — used to split real API traffic from bot-scan noise.
+# Each synthetic span carries ``titan.path_category`` with one of these
+# values so the Endpoints page can filter or group by category. The
+# metric counters add the same attribute so dashboards can also split
+# volume by category (e.g. "how many bot hits per minute").
+REAL_API_PREFIXES = ("/api/",)
+BOT_SCAN_PREFIXES = (
+    "/.git/", "/.env", "/.aws/", "/wp-", "/wp/", "/xmlrpc.php",
+    "/vpn/", "/cgi-bin/", "/phpmyadmin/", "/manager/",
+    "/administrator/", "/plugins/", "/media/system/",
+    "/_profiler/", "/vendor/", "/node_modules/",
+    "/api/v1/0.1/",  # /api/v1/0.1 — Joomla scanner path
+)
+CATEGORY_REAL = "real"
+CATEGORY_NOISE = "noise"
+
+
+def path_category(method: str, endpoint: str) -> str:
+    """``real`` for matched API routes, ``noise`` for everything else.
+
+    The split is intentionally simple — anything under ``/api/`` that
+    matches a known method is real; anything else is noise (bot scans,
+    favicon hits, the dashboard's own ``/``). The user can extend the
+    prefix lists if the boundary needs to move.
+    """
+    if method.upper() == "OPTIONS":
+        return CATEGORY_NOISE  # we still drop OPTIONS earlier, but be safe
+    path = _endpoints_v2_url(endpoint) if endpoint else ""
+    if any(path.startswith(p) for p in BOT_SCAN_PREFIXES):
+        return CATEGORY_NOISE
+    if any(path.startswith(p) for p in REAL_API_PREFIXES):
+        return CATEGORY_REAL
+    return CATEGORY_NOISE
+
+
 # ---------------------------------------------------------------------------
 # boto3 / CloudWatch Logs polling
 # ---------------------------------------------------------------------------
@@ -264,9 +299,11 @@ def record_event(event: dict[str, Any]) -> None:
     if not method or not endpoint:
         return
 
+    category = path_category(method, endpoint)
     attrs = {
         "http.request.method": method,
         "url.path": endpoint,
+        "titan.path_category": category,
     }
     if status_code is not None:
         attrs["http.response.status_code"] = int(status_code)
@@ -297,6 +334,7 @@ def record_event(event: dict[str, Any]) -> None:
         endpoint=endpoint,
         status_code=status_code,
         duration_ms=duration_ms,
+        category=category,
     )
 
     if event_id:
@@ -323,6 +361,7 @@ def emit_synthetic_span(
     endpoint: str,
     status_code: int | None,
     duration_ms: Any,
+    category: str,
 ) -> None:
     """Emit one INTERNAL span with HTTP attributes that the traceway
     ``trace_converter`` recognises as an endpoint entry point.
@@ -386,6 +425,7 @@ def emit_synthetic_span(
         span.set_attribute("url.path", _endpoints_v2_url(endpoint))
         if status_code is not None:
             span.set_attribute("http.response.status_code", int(status_code))
+        span.set_attribute("titan.path_category", category)
         ip = entry.get("ip")
         if ip:
             span.set_attribute("client.address", ip)
