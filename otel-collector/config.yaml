@@ -23,7 +23,7 @@
 #   The OTel Collector's awscloudwatch receiver only ingests CloudWatch Logs
 #   (its `logs:` block is the only config the schema accepts; metrics
 #   support is "Undefined"). The CloudWatch Metrics half of titan-monitor
-#   is handled by `titan/cw-metrics-exporter/` — a small Python sidecar
+#   is handled by `cw-metrics-exporter/` — a small Python sidecar
 #   that uses boto3 + the GetMetricData API to poll the same EC2 + CWAgent
 #   metrics and push them as OTLP. This split mirrors what titan-monitor
 #   itself did: two different APIs (Logs vs Metrics), two different tools.
@@ -109,6 +109,14 @@ processors:
           # Environment — `where` clause is a boolean expression with `and`.
           - set(resource.attributes["deployment.environment.name"], "prod") where(resource.attributes["cloudwatch.log.group.name"] != "" and IsMatch(resource.attributes["cloudwatch.log.group.name"], "/prod/"))
           - set(resource.attributes["deployment.environment.name"], "dev") where(resource.attributes["cloudwatch.log.group.name"] != "" and IsMatch(resource.attributes["cloudwatch.log.group.name"], "/dev/"))
+          # Subsystem — extract the third path segment from the CW group
+          # name. Independent of service.name so users can pivot on
+          # resource.titan.subsystem (= "api", "api-errors", "services",
+          # "db", ...) in the traceway Logs page even if service.name
+          # gets rewritten downstream. Reads the receiver-populated
+          # `cloudwatch.log.group.name` resource attr so this works in
+          # the resource-context block without depending on log attrs.
+          - set(resource.attributes["titan.subsystem"], ExtractPatterns(resource.attributes["cloudwatch.log.group.name"], "/aws/ec2/titanprediction/[^/]+/(?P<sub>[^/]+)")["sub"]) where(resource.attributes["cloudwatch.log.group.name"] != "" and IsMatch(resource.attributes["cloudwatch.log.group.name"], "^/aws/ec2/titanprediction/[^/]+/[^/]+$"))
       - context: log
         statements:
           # Parse JSONL bodies — but only when the body actually looks like
@@ -124,34 +132,68 @@ processors:
           # keeps the record, but the indexed assignments below silently
           # produce empty values.
           - 'set(log.attributes["titan.parsed"], ParseJSON(log.body)) where(log.body != "" and IsMatch(log.body, "^\\{"))'
+          # Keep the ORIGINAL JSON line as a string attribute. The body is
+          # rewritten into a one-liner further down, so this is the only
+          # place the full record survives — nested payload dicts
+          # (`details`, `parameters`, anything the backend adds later)
+          # included. OTTL 0.119.0 has no converter that marshals a Map or
+          # Slice attribute to a string (no JSONString / JSONMarshal /
+          # MapToJSON, and String() silently no-ops on a Map), and
+          # traceway's extractAttributes drops non-scalars outright — so a
+          # raw string is the only shape that reliably carries a payload
+          # through to the Logs page.
+          #
+          # Read it via the expanded row's `titan.raw` tile, or search it
+          # with an attribute filter:  log.titan.raw  ~=  user_type
+          - 'set(log.attributes["titan.raw"], log.body) where(log.body != "" and IsMatch(log.body, "^\\{"))'
           # Lift each top-level field out as a flat log attribute. The
           # intermediate `titan.parsed` KvlistValue is dropped at
           # traceway's extractAttributes anyway, but we keep the wire
-          # payload tidy.
+          # payload tidy. Field names mirror the actual activity
+          # loggers in the TitanPrediction backend (api/, services/,
+          # db/), NOT speculative names — see end-of-file note for
+          # the per-logger schema reference.
           - set(log.attributes["titan.action"], log.attributes["titan.parsed"]["action"])
           - set(log.attributes["titan.status"], log.attributes["titan.parsed"]["status"])
           - set(log.attributes["titan.username"], log.attributes["titan.parsed"]["username"])
-          - set(log.attributes["titan.endpoint"], log.attributes["titan.parsed"]["endpoint"])
+          - set(log.attributes["titan.ip"], log.attributes["titan.parsed"]["ip"])
+          - set(log.attributes["titan.country"], log.attributes["titan.parsed"]["country"])
           - set(log.attributes["titan.method"], log.attributes["titan.parsed"]["method"])
-          - set(log.attributes["titan.phase"], log.attributes["titan.parsed"]["phase"])
+          - set(log.attributes["titan.endpoint"], log.attributes["titan.parsed"]["endpoint"])
+          - set(log.attributes["titan.route"], log.attributes["titan.parsed"]["route"])
+          - set(log.attributes["titan.user_agent"], log.attributes["titan.parsed"]["user_agent"])
+          - set(log.attributes["titan.status_code"], log.attributes["titan.parsed"]["status_code"])
           - set(log.attributes["titan.duration_ms"], log.attributes["titan.parsed"]["duration_ms"])
+          - set(log.attributes["titan.service"], log.attributes["titan.parsed"]["service"])
+          - set(log.attributes["titan.operation"], log.attributes["titan.parsed"]["operation"])
+          - set(log.attributes["titan.phase"], log.attributes["titan.parsed"]["phase"])
           - set(log.attributes["titan.error"], log.attributes["titan.parsed"]["error"])
           - set(log.attributes["titan.traceback"], log.attributes["titan.parsed"]["traceback"])
-          - set(log.attributes["titan.ip"], log.attributes["titan.parsed"]["ip"])
-          - set(log.attributes["titan.user_agent"], log.attributes["titan.parsed"]["user_agent"])
+          # NOTE: `details` (api/admin/services events) and `parameters`
+          # (services operation events, db audit) are the only dict-valued
+          # fields the activity loggers emit. They are NOT lifted
+          # individually — OTTL 0.119.0 cannot convert a Map attribute to a
+          # string, and traceway's extractAttributes drops non-scalars.
+          # They are preserved intact inside `titan.raw` (see above).
           # Mirror to OTel semantic-convention attribute names so the
           # traceway Endpoints page and dashboard widgets can use them
           # without any per-source custom mapping. Names follow the
           # OTel HTTP semantic conventions:
           # https://opentelemetry.io/docs/specs/semconv/http/http-spans/
-          - set(log.attributes["http.request.method"], log.attributes["titan.method"]) where(log.attributes["titan.method"] != "")
-          - set(log.attributes["url.path"], log.attributes["titan.endpoint"]) where(log.attributes["titan.endpoint"] != "")
-          - set(log.attributes["http.response.status_code"], log.attributes["titan.status_code"]) where(log.attributes["titan.status_code"] != "")
-          - set(log.attributes["client.address"], log.attributes["titan.ip"]) where(log.attributes["titan.ip"] != "")
-          - set(log.attributes["user_agent.original"], log.attributes["titan.user_agent"]) where(log.attributes["titan.user_agent"] != "")
-          - set(log.attributes["enduser.id"], log.attributes["titan.username"]) where(log.attributes["titan.username"] != "")
-          - set(log.attributes["exception.message"], log.attributes["titan.error"]) where(log.attributes["titan.error"] != "")
-          - set(log.attributes["exception.stacktrace"], log.attributes["titan.traceback"]) where(log.attributes["titan.traceback"] != "")
+          # enduser.id as a RESOURCE attribute — `resource.enduser.id = alice`
+          # is reachable in the dashboard's "Add filter" dialog without a
+          # `log.` prefix. Done here (in the log context) because resource
+          # and log contexts execute sequentially in OTTL transform
+          # processors; we read titan.username after the lift several
+          # statements above this block.
+          - set(resource.attributes["enduser.id"], log.attributes["titan.username"]) where(IsString(log.attributes["titan.username"]))
+          - set(log.attributes["http.request.method"], log.attributes["titan.method"]) where(IsString(log.attributes["titan.method"]))
+          - set(log.attributes["url.path"], log.attributes["titan.endpoint"]) where(IsString(log.attributes["titan.endpoint"]))
+          - set(log.attributes["http.response.status_code"], log.attributes["titan.status_code"]) where(log.attributes["titan.status_code"] != nil)
+          - set(log.attributes["client.address"], log.attributes["titan.ip"]) where(IsString(log.attributes["titan.ip"]))
+          - set(log.attributes["user_agent.original"], log.attributes["titan.user_agent"]) where(IsString(log.attributes["titan.user_agent"]))
+          - set(log.attributes["exception.message"], log.attributes["titan.error"]) where(IsString(log.attributes["titan.error"]))
+          - set(log.attributes["exception.stacktrace"], log.attributes["titan.traceback"]) where(IsString(log.attributes["titan.traceback"]))
           - delete_key(log.attributes, "titan.parsed")
           # Map Titan status / phase to OTel severity so traceway can use
           # it for Issues (severity_text="ERROR" → becomes an Issue) and
@@ -161,12 +203,30 @@ processors:
           - 'set(log.severity_number, 17) where(log.attributes["titan.status"] == "error" or log.attributes["titan.phase"] == "error")'
           - 'set(log.severity_text, "WARN") where(log.attributes["titan.status"] == "failure" or log.attributes["titan.status"] == "blocked")'
           - 'set(log.severity_number, 13) where(log.attributes["titan.status"] == "failure" or log.attributes["titan.status"] == "blocked")'
-          # Shorten the body to just the action+status+message so the Logs
-          # UI shows a useful one-liner instead of raw JSON. For DB-style
-          # plain-string bodies (no JSON parse) we leave the body alone.
-          - 'set(log.body, Concat([log.attributes["titan.action"], " ", log.attributes["titan.status"]], "")) where(log.attributes["titan.action"] != "" and log.attributes["titan.status"] != "")'
-          - 'set(log.body, Concat([log.attributes["titan.phase"], " (svc=", log.attributes["titan.parsed"]["service"], ")"], "")) where(log.attributes["titan.action"] == "" and log.attributes["titan.phase"] != "")'
-          - 'keep_keys(resource.attributes, ["service.name", "service.instance.id", "deployment.environment.name", "cloud.provider", "cloud.region", "host.name"])'
+          # Body composition — produce a useful one-liner for the Logs page.
+          #
+          # Two OTTL facts drive the shape of this block:
+          #   1. Presence is tested with IsString(), NOT `!= ""`. A key the
+          #      source JSON omits (or sets to null) lifts to nil, and
+          #      `nil != ""` is TRUE — so `!= ""` guards fire on missing
+          #      data and render `<nil>` into the body.
+          #   2. The rules are ordered LEAST-specific first. Each `set`
+          #      overwrites the previous one, so the richest match runs last
+          #      and wins. Order them the other way round and a later,
+          #      poorer rule silently clobbers the better one.
+          #   1. services/db, bare phase
+          #   2. services/db, phase + service name
+          #   3. services/db, phase + error
+          #   4. api/admin, anonymous      -> action + status
+          #   5. api/admin, with username  -> action + status + (username)
+          # Plain-string bodies (websocket, unparsed) match no rule and keep
+          # the original message. The full JSON is never lost — see titan.raw.
+          - 'set(log.body, Concat([log.attributes["titan.phase"]], "")) where(IsString(log.attributes["titan.action"]) == false and IsString(log.attributes["titan.phase"]))'
+          - 'set(log.body, Concat([log.attributes["titan.phase"], " (svc=", log.attributes["titan.service"], ")"], "")) where(IsString(log.attributes["titan.action"]) == false and IsString(log.attributes["titan.phase"]) and IsString(log.attributes["titan.service"]))'
+          - 'set(log.body, Concat([log.attributes["titan.phase"], " ", log.attributes["titan.error"]], "")) where(IsString(log.attributes["titan.action"]) == false and IsString(log.attributes["titan.phase"]) and IsString(log.attributes["titan.error"]))'
+          - 'set(log.body, Concat([log.attributes["titan.action"], " ", log.attributes["titan.status"]], "")) where(IsString(log.attributes["titan.action"]) and IsString(log.attributes["titan.status"]))'
+          - 'set(log.body, Concat([log.attributes["titan.action"], " ", log.attributes["titan.status"], " (", log.attributes["titan.username"], ")"], "")) where(IsString(log.attributes["titan.action"]) and IsString(log.attributes["titan.status"]) and IsString(log.attributes["titan.username"]))'
+          - 'keep_keys(resource.attributes, ["service.name", "service.instance.id", "deployment.environment.name", "cloud.provider", "cloud.region", "host.name", "titan.subsystem", "enduser.id"])'
 
   # Batch — traceway's /api/otel/v1/logs handler is sized for batches.
   batch:
@@ -202,3 +262,58 @@ service:
       receivers: [awscloudwatch]
       processors: [resource, transform/logs, batch]
       exporters: [otlphttp]
+
+# ==============================================================================
+# Per-logger schema reference (TitanPrediction backend)
+# ==============================================================================
+#
+# The lifts above are tuned to the actual key names produced by the three
+# activity loggers in the TitanPrediction repo
+# (https://github.com/TitanPrediction/backend):
+#
+#   * api/activity_logger.py
+#       - log_api_event:      timestamp, action, status, username, ip, country,
+#                             method, endpoint, route, user_agent, status_code,
+#                             duration_ms, details
+#       - log_api_error:      timestamp, action, username, ip, method, endpoint,
+#                             route, user_agent, status_code, duration_ms, error,
+#                             traceback, details (typically {"reason": str(exc), ...})
+#       - log_admin_event:    timestamp, action, status, username, ip, country,
+#                             method, endpoint, user_agent, details
+#                             (NO status_code or duration_ms on admin events)
+#
+#   * services/activity_logger.py
+#       - log_service_event:  timestamp, service, phase, duration_ms, details,
+#                             error, traceback
+#       - log_operation_event: timestamp, operation, phase, duration_ms,
+#                             parameters, error, traceback
+#
+#   * db/activity_logger.py — _JsonLineFormatter renders fixed fields plus
+#                             extras passed via `extra=`. Per-call extras for
+#                             audit decorators: operation, phase, parameters,
+#                             result.
+#
+# Field name coverage so we know what exists and what doesn't:
+#
+#   * Lifted as scalars (log.titan.*): action, status, username, ip,
+#                           country, method, endpoint, route, user_agent,
+#                           status_code, duration_ms, service, operation,
+#                           phase, error, traceback
+#   * Dict-valued fields — `details`, `parameters`, `result` — are NOT
+#     lifted individually. OTTL 0.119.0 has no Map/Slice → string
+#     converter, and traceway's extractAttributes drops non-scalars, so
+#     they would silently vanish. They survive intact inside
+#     `log.titan.raw` (the untouched original JSON line), which is the
+#     supported way to read them.
+#   * NOT lifted:           timestamp (it's the OTel log timestamp itself),
+#                           level, logger, module, function, line, message
+#                           (DB formatter fields — out of scope; they are not
+#                           derived from request context the traceway user
+#                           filters on)
+#   * NOT WRITTEN by any activity logger: request_body, response_body,
+#                           query_params, request_headers. The loggers
+#                           summarize rather than dump (see
+#                           `_summarize_value`). If payload capture is ever
+#                           added to the backend, no config change is needed
+#                           — it will simply start appearing in titan.raw.
+# ==============================================================================
