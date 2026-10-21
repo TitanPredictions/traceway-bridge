@@ -1,7 +1,7 @@
 # traceway ↔ TitanPrediction bridge — TODO
 
-Last updated: 2026-10-19. Tracks follow-on work after the initial
-`traceway/titan/` setup that ships in the local `traceway` clone.
+Last updated: 2026-10-21. Tracks follow-on work after the bridge was
+split out of the `traceway` clone into this standalone repo (item 4).
 
 ---
 
@@ -18,7 +18,7 @@ slow today" by deploy.
 `$(git rev-parse --short HEAD)` in the systemd unit) and stamp it on
 the span resource. Falls back to `"unknown"` so the column is never
 empty. **No backend/ change needed** — entirely in
-`titan/cw-logs-metrics-exporter/cw_logs_metrics_exporter.py`.
+`cw-logs-metrics-exporter/cw_logs_metrics_exporter.py`.
 
 ### 2. Wire a TitanPrediction-specific dashboard template
 
@@ -35,7 +35,7 @@ The `EC2 System Monitoring` dashboard shipped in commit
 
 **Action:** build a JSON dashboard with the same `endpoints_v2` /
 `metric_points` schema as the existing templates; commit it under
-`titan/dashboards/titanprediction.json`. Apply via
+`dashboards/titanprediction.json`. Apply via
 `POST /api/dashboards/populate-defaults` after creating the project.
 
 ### 3. Set up notification rules
@@ -53,67 +53,54 @@ Discord/Slack/email channel (channels live in `notification_channels`):
 | `no_data` | `system.cpu.utilization` no points in 5 min | Agent down |
 
 **Action:** scripted setup (one-shot curl per rule) — see
-[titan/scripts/setup-notification-rules.sh](scripts/setup-notification-rules.sh)
+[setup-notification-rules.sh](scripts/setup-notification-rules.sh)
 (stub — to write).
 
 ---
 
 ## Short term (next month)
 
-### 4. Move `titan/` out of the traceway clone into a standalone repo
+### 4. ~~Move `titan/` out of the traceway clone into a standalone repo~~ — **done**
 
-The `titan/` directory is currently inside the local `traceway`
-clone, which is a fork of `tracewayapp/traceway`. The bridge config
-isn't traceway's concern — it's TitanPrediction's deployment glue.
-Having it in a separate repo means:
+This *is* the standalone repo: `TitanPredictions/traceway-bridge`, split out of
+the `traceway` clone with `git subtree split` and restructured in
+`aa281133`. Done:
 
-- Independent versioning: pin the traceway image to a tag without
-  re-releasing the bridge.
-- Cleaner PRs: dev team changes (e.g. add a new exporter) don't go
-  through traceway review.
-- Lower friction: the traceway repo is large; cloning just `titan/`
-  is faster for new devs.
+- Repo created, `titan/` split into it as `main`, build contexts and paths
+  flattened to the repo root.
+- `Makefile` (`up` / `logs` / `down` / `token`) and `CONTRIBUTING.md` added.
+- CI (`.github/workflows/ci.yml`) runs `py_compile` on both sidecars and
+  validates `otel-collector/config.yaml` with the contrib image.
 
-**Repo name:** `TitanPredictions/traceway-bridge` (or whatever the
-team prefers — `titan-observability`, `titan-cloudwatch-bridge`).
-`traceway-bridge` is the most accurate.
+Two things the split deliberately did **not** do:
 
-**Action:**
+- The compose stack still needs a traceway checkout alongside it — the two
+  upstream compose files (`docker-compose.yml`, `docker-compose.sqlite.yml`)
+  are traceway's, and `TRACEWAY_OTLP_ENDPOINT_BASE=http://traceway:80/api/otel`
+  resolves by service name on the shared network. Running the published
+  traceway image and `docker network connect`ing the bridge to it is the
+  remaining step to make this truly single-repo.
+- `titan/README.md` inside the old traceway clone is retained for two release
+  cycles so the team can switch over, then deleted.
 
-1. Create the repo on GitHub.
-2. `git subtree split -P titan -b titan-bootstrap` on the local
-   `traceway` clone, push the branch as the new repo's `main`.
-3. Move the README, .env.example, docker-compose into a layout that
-   doesn't require the traceway repo to be present (current
-   `docker-compose.titan.yml` uses `include:` paths to the upstream
-   compose — change to standalone).
-4. Add a top-level `Makefile` with `make up`, `make logs`,
-   `make down`, `make token` (helps new devs).
-5. Add a CI workflow (`.github/workflows/lint.yml`) that:
-   - Runs `python -m py_compile` on both sidecars
-   - Validates `otel-collector/config.yaml` with the OTel contrib
-     image
-   - Lints `docker-compose.titan.yml`
-
-**Migration plan:** keep the old path in `traceway/titan/` for two
-release cycles so the team has time to switch over. After that,
-delete from the traceway clone.
+Historical detail on what the coupling was, and what broke: see
+[`SESSION-2026-10-21-log-search.md`](./SESSION-2026-10-21-log-search.md).
 
 ### 5. Dev-team onboarding doc
 
 Each new dev runs the bridge on their own laptop (or in a shared
-staging box). The current `titan/README.md` covers the run-it steps
-but not the onboarding flow. Add `titan/docs/onboarding.md`:
+staging box). The current `README.md` covers the run-it steps
+but not the onboarding flow. Add `docs/onboarding.md`:
 
 - How to create a traceway account (cloud or local) and grab a token
-- How to populate their `titan/.env` from `backend/config.ini`
+- How to populate their `.env` from `backend/config.ini`
   (the same script we ran during setup)
 - How to point the backend at the bridge (via tunnel, ngrok, or
   a shared host)
 - Troubleshooting matrix: token expired, AWS throttling, OTLP
   exporter connection refused, etc.
 
-**Status:** partially covered by `titan/README.md` Troubleshooting
+**Status:** partially covered by `README.md` Troubleshooting
 section. Extend with the dev-specific scenarios.
 
 ### 6. CI for the bridge sidecars

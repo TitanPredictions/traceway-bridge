@@ -1,4 +1,4 @@
-.PHONY: help up down logs ps build push login lint validate clean token
+.PHONY: help up down logs ps build push lint validate clean token
 
 # traceway-bridge top-level Makefile.
 #
@@ -7,6 +7,12 @@
 # The compose stack pulls `traceway` (Postgres + ClickHouse + traceway
 # app) from the traceway repo one level up — this is documented in
 # README.md.
+#
+# Every compose call passes `--project-directory .`. Without it compose
+# takes the project directory from the FIRST `-f` file, i.e.
+# `../traceway/`, and then resolves this repo's relative paths (the two
+# sidecar build contexts, the collector config bind mount) against the
+# traceway checkout — where they do not exist. The flag pins them here.
 
 SHELL := /bin/bash
 
@@ -14,14 +20,16 @@ help:                   ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
 up:                    ## Build images (if needed) and start the full stack in the background.
-	docker compose -f ../traceway/docker-compose.yml \
+	docker compose --project-directory . \
+	               -f ../traceway/docker-compose.yml \
 	               -f ../traceway/docker-compose.sqlite.yml \
 	               -f docker-compose.titan.yml \
 	               --env-file .env \
 	               up -d --build
 
 down:                  ## Stop the stack (volumes kept).
-	docker compose -f ../traceway/docker-compose.yml \
+	docker compose --project-directory . \
+	               -f ../traceway/docker-compose.yml \
 	               -f ../traceway/docker-compose.sqlite.yml \
 	               -f docker-compose.titan.yml \
 	               --env-file .env \
@@ -34,34 +42,35 @@ logs:                  ## Tail logs from all three sidecars + the OTel collector
 	wait
 
 ps:                    ## List the running containers.
-	docker compose -f ../traceway/docker-compose.yml \
+	docker compose --project-directory . \
+	               -f ../traceway/docker-compose.yml \
 	               -f ../traceway/docker-compose.sqlite.yml \
 	               -f docker-compose.titan.yml \
 	               --env-file .env \
 	               ps
 
 build:                 ## Build the two Python sidecar images.
-	docker compose -f ../traceway/docker-compose.yml \
+	docker compose --project-directory . \
+	               -f ../traceway/docker-compose.yml \
 	               -f ../traceway/docker-compose.sqlite.yml \
 	               -f docker-compose.titan.yml \
 	               --env-file .env \
 	               build cw-metrics-exporter cw-logs-metrics-exporter
 
 push:                  ## Restart the three bridge services (after config edits).
-	docker compose -f ../traceway/docker-compose.yml \
+	docker compose --project-directory . \
+	               -f ../traceway/docker-compose.yml \
 	               -f ../traceway/docker-compose.sqlite.yml \
 	               -f docker-compose.titan.yml \
 	               --env-file .env \
 	               up -d --force-recreate cw-metrics-exporter cw-logs-metrics-exporter otel-collector
 
-login:                 ## Open an interactive shell in the OTel collector image.
-	docker run --rm -it --network container:titan-otel-collector \
-	               otel/opentelemetry-collector-contrib:0.119.0 \
-	               /bin/sh
-
 validate:              ## Run the OTel collector config through `validate` (catches typos before `up`).
 	docker run --rm \
-	  -v $(PWD)/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro \
+	  -v $(CURDIR)/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro \
+	  -e AWS_REGION=$${AWS_REGION:-eu-west-3} \
+	  -e OTLP_TOKEN=placeholder \
+	  -e TRACEWAY_OTLP_ENDPOINT_BASE=http://traceway:80/api/otel \
 	  otel/opentelemetry-collector-contrib:0.119.0 \
 	  validate --config=/etc/otelcol/config.yaml
 
@@ -73,7 +82,8 @@ lint:                  ## Python syntax check on the two sidecar modules.
 	done
 
 clean:                 ## Stop stack, remove bridge images and the traceway-data volume.
-	docker compose -f ../traceway/docker-compose.yml \
+	docker compose --project-directory . \
+	               -f ../traceway/docker-compose.yml \
 	               -f ../traceway/docker-compose.sqlite.yml \
 	               -f docker-compose.titan.yml \
 	               --env-file .env \

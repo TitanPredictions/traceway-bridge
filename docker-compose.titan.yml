@@ -6,14 +6,14 @@
 #
 # This file does NOT include the upstream traceway compose on purpose —
 # `include:` resolves relative paths against the file it's written in, and
-# the merge order is not always what you want. Instead, run it from the
-# traceway repo root with three `-f` flags:
+# the merge order is not always what you want. Instead, run it from a
+# traceway checkout with three `-f` flags, pointing at this repo by path:
 #
 #     docker compose \
-#         -f docker-compose.yml \
-#         -f docker-compose.sqlite.yml \
-#         -f titan/docker-compose.titan.yml \
-#         --env-file titan/.env \
+#         -f /path/to/traceway/docker-compose.yml \
+#         -f /path/to/traceway/docker-compose.sqlite.yml \
+#         -f /path/to/traceway-bridge/docker-compose.titan.yml \
+#         --env-file /path/to/traceway-bridge/.env \
 #         up -d
 #
 # The first two compose files are the upstream recipe (base all-in-one
@@ -21,6 +21,9 @@
 # traceway service's Dockerfile to the SQLite build). The third adds the
 # collector service and wires it onto the same default network so it can
 # reach `traceway` by hostname.
+#
+# Every path inside this file is relative to the *repo root* of
+# traceway-bridge, not to wherever you run `docker compose` from.
 # ==============================================================================
 
 services:
@@ -32,13 +35,11 @@ services:
     volumes:
       # Bind-mount the collector config instead of baking it into a custom
       # image so edits take effect on `docker compose restart otel-collector`
-      # without rebuilding. Compose resolves this relative path against the
-      # working directory you `docker compose` from, which the README pins
-      # to the traceway repo root.
-      - ./titan/otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+      # without rebuilding.
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
     environment:
       # AWS creds + EC2 instance identity. ALL of these are read from the
-      # titan/.env file (gitignored) so the traceway repo never sees real
+      # .env file (gitignored) so the traceway repo never sees real
       # secrets. The collector does not require AWS credentials when running
       # outside AWS — it just won't be able to poll metrics.
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
@@ -60,7 +61,7 @@ services:
       #   1. Open http://localhost:80
       #   2. Register / log in
       #   3. Settings → Projects → New project (framework = OpenTelemetry)
-      #   4. Copy the project token into titan/.env as OTLP_TOKEN
+      #   4. Copy the project token into .env as OTLP_TOKEN
       # Traceway's UseClientAuth middleware treats this exactly like the
       # browser SDK's Bearer token, so it will route data into the project.
       OTLP_TOKEN: ${TRACEWAY_BACKEND_TOKEN}
@@ -70,24 +71,36 @@ services:
     # project name → e.g. `traceway_default`). No `networks:` block needed:
     # a service without one is attached to every default-network project
     # that ships via `-f`.
+    # No healthcheck, deliberately. Two independent reasons, either of which
+    # alone makes a container-local probe impossible:
+    #
+    #   1. The image is distroless — no shell, no wget, no curl, nothing but
+    #      /otelcol-contrib. `docker exec` and every CMD/SHELL healthcheck
+    #      fail with "executable file not found".
+    #   2. Nothing listens on :13133. That port is served by the
+    #      `health_check` extension, which this config does not enable, so
+    #      the old probe URL was connection-refused even in an image that
+    #      had wget.
+    #
+    # Nothing gates on `service_healthy` for this service, and
+    # `restart: unless-stopped` already covers crash loops — so the old
+    # healthcheck bought no behaviour, only a permanently wrong `unhealthy`
+    # in `docker ps`. Verify it by hand instead (see README §4).
+    #
+    # To get a real health signal back, enable the extension in
+    # config.yaml (`extensions: {health_check: {endpoint: 0.0.0.0:13133}}`)
+    # AND probe it from another container on this network — not from here.
     healthcheck:
-      # The collector's own /health endpoint (default :13133) returns 200
-      # once the config is parsed and the pipeline is wired. If it doesn't
-      # come up in 30 s the AWS creds are almost always wrong.
-      test: ["CMD", "wget", "-qO-", "http://localhost:13133/"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      disable: true
 
   cw-metrics-exporter:
     # CloudWatch Metrics → OTLP. The OTel Collector contrib has no first-
     # party CW Metrics receiver, so this sidecar polls GetMetricData
     # directly with boto3. Image is built from
-    # titan/cw-metrics-exporter/Dockerfile so the Python SDK versions
+    # cw-metrics-exporter/Dockerfile so the Python SDK versions
     # stay pinned (newer OTel majors flip a lot of defaults).
     build:
-      context: ./titan/cw-metrics-exporter
+      context: ./cw-metrics-exporter
     container_name: titan-cw-metrics-exporter
     restart: unless-stopped
     environment:
@@ -119,7 +132,7 @@ services:
     # Endpoints page and endpoint-scoped notification rules
     # (error_rate_threshold, endpoint_p95_threshold).
     build:
-      context: ./titan/cw-logs-metrics-exporter
+      context: ./cw-logs-metrics-exporter
     container_name: titan-cw-logs-metrics-exporter
     restart: unless-stopped
     environment:
